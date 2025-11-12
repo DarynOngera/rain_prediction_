@@ -3,3 +3,8 @@ requests
 numpy 
 argparse
 scikit-learn
+matplotlib
+lightgbm
+prophet
+subprocess
+joblib

@@ -1,76 +1,129 @@
 # preprocess.py
-import os
-import argparse
 import pandas as pd
 import numpy as np
 
-class Preprocessor:
-    def __init__(self, input_file, output_file):
-        self.input_file = input_file
-        self.output_file = output_file
+class RainfallPreprocessor:
+    def __init__(self, filepath: str):
+        self.filepath = filepath
         self.df = None
 
     def load_data(self):
-        print(f"[INFO] Loading dataset from {self.input_file} ...")
-        self.df = pd.read_csv(self.input_file, parse_dates=["date"])
-        self.df = self.df.sort_values("date").reset_index(drop=True)
-        print(f"[INFO] Data shape after load: {self.df.shape}")
+        """Load dataset and parse dates"""
+        self.df = pd.read_csv(self.filepath, parse_dates=["date"])
+        self.df.sort_values("date", inplace=True)
+        self.df.reset_index(drop=True, inplace=True)
+        return self.df
 
-    def add_targets(self):
-        # Predict future rainfall based on rfh (10-day rainfall)
-        self.df["target_weekly"] = self.df["rfh"].shift(-7)
-        self.df["target_monthly"] = self.df["rfh"].shift(-30)
-        self.df["target_yearly"] = self.df["rfh"].shift(-365)
-        print("[OK] Target variables created")
+    def feature_engineering(self):
+        """Generate targets + temporal + lags + rolling + seasonal + anomalies + persistence features"""
+        df = self.df.copy()
 
-    def add_temporal_features(self):
-        self.df["year"] = self.df["date"].dt.year
-        self.df["month"] = self.df["date"].dt.month
-        self.df["day"] = self.df["date"].dt.day
-        self.df["day_of_week"] = self.df["date"].dt.dayofweek
-        self.df["is_weekend"] = self.df["day_of_week"].isin([5,6]).astype(int)
+        # -----------------------
+        # 1. Target Variables (shift by dekads, not days)
+        # -----------------------
+        df["target_next_dekad"] = df["rfh"].shift(-1)    # 10 days ahead
+        df["target_next_month"] = df["rfh"].shift(-3)    # ~1 month (3 dekads)
+        df["target_next_season"] = df["rfh"].shift(-9)   # ~3 months
+        df["target_next_year"] = df["rfh"].shift(-36)    # ~1 year
 
-        # Cyclical encoding for month
-        self.df["month_sin"] = np.sin(2 * np.pi * self.df["month"] / 12)
-        self.df["month_cos"] = np.cos(2 * np.pi * self.df["month"] / 12)
+        # -----------------------
+        # 2. Temporal Features
+        # -----------------------
+        df["year"] = df["date"].dt.year
+        df["month"] = df["date"].dt.month
+        df["day"] = df["date"].dt.day
+        df["day_of_week"] = df["date"].dt.dayofweek
+        df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
 
-        print("[OK] Temporal features created")
+        # Dekad of year (1–36)
+        df["dekad"] = ((df["date"].dt.month - 1) * 3) + (df["date"].dt.day // 10) + 1
+        df["dekad_sin"] = np.sin(2 * np.pi * df["dekad"] / 36)
+        df["dekad_cos"] = np.cos(2 * np.pi * df["dekad"] / 36)
 
-    def add_lag_features(self):
-        self.df["rainfall_lag_1"] = self.df["rfh"].shift(1)
-        self.df["rainfall_lag_7"] = self.df["rfh"].shift(7)
-        print("[OK] Lag features created")
+        # -----------------------
+        # 3. Lag Features (dekadal horizons)
+        # -----------------------
+        lag_dekads = [1, 3, 6, 9, 18, 36]  # 1 dekad, 1m, 2m, season, half-year, year
+        for col in ["rfh", "r1h", "r3h", "rfq", "r1q", "r3q"]:
+            for lag in lag_dekads:
+                df[f"{col}_lag_{lag}"] = df[col].shift(lag)
 
-    def add_rolling_features(self):
-        self.df["rainfall_roll_mean_7"] = self.df["rfh"].rolling(window=7).mean()
-        self.df["rainfall_roll_std_7"] = self.df["rfh"].rolling(window=7).std()
-        print("[OK] Rolling window features created")
+        # -----------------------
+        # 4. Rolling Window Features (in dekads)
+        # -----------------------
+        rolling_windows = [3, 9, 36]  # 1m, season, year
+        for col in ["rfh", "r1h", "r3h"]:
+            for window in rolling_windows:
+                df[f"{col}_roll_mean_{window}"] = df[col].rolling(window, min_periods=1).mean()
+                df[f"{col}_roll_std_{window}"] = df[col].rolling(window, min_periods=1).std()
+                df[f"{col}_roll_min_{window}"] = df[col].rolling(window, min_periods=1).min()
+                df[f"{col}_roll_max_{window}"] = df[col].rolling(window, min_periods=1).max()
+                df[f"{col}_roll_skew_{window}"] = df[col].rolling(window, min_periods=1).skew()
 
-    def run_pipeline(self):
-        self.load_data()
-        self.add_targets()
-        self.add_temporal_features()
-        self.add_lag_features()
-        self.add_rolling_features()
+        # -----------------------
+        # 5. Deviation & Ratios from LTA
+        # -----------------------
+        df["rfh_dev"] = df["rfh"] - df["rfh_avg"]
+        df["r1h_dev"] = df["r1h"] - df["r1h_avg"]
+        df["r3h_dev"] = df["r3h"] - df["r3h_avg"]
 
-        # Drop rows with NaN (introduced by shifts/rolling)
-        before = len(self.df)
-        self.df = self.df.dropna().reset_index(drop=True)
-        after = len(self.df)
-        print(f"[INFO] Dropped {before - after} rows due to NaNs from feature engineering")
+        df["rfh_ratio"] = df["rfh"] / (df["rfh_avg"] + 1e-6)
+        df["r1h_ratio"] = df["r1h"] / (df["r1h_avg"] + 1e-6)
+        df["r3h_ratio"] = df["r3h"] / (df["r3h_avg"] + 1e-6)
 
-        # Save
-        os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
-        self.df.to_csv(self.output_file, index=False)
-        print(f"[SUCCESS] Preprocessed data saved to {self.output_file}")
+        # -----------------------
+        # 6. Change Rates
+        # -----------------------
+        for col in ["rfh", "r1h", "r3h", "rfq", "r1q", "r3q"]:
+            df[f"{col}_diff"] = df[col].diff()
 
+        # -----------------------
+        # 7. Persistence Features
+        # -----------------------
+        df["dry_spell"] = (df["rfh"] < df["rfh_avg"]).astype(int)
+        df["dry_spell_len"] = df["dry_spell"] * (
+            df["dry_spell"].groupby((df["dry_spell"] != df["dry_spell"].shift()).cumsum()).cumcount() + 1
+        )
+
+        df["wet_spell"] = (df["rfh"] > df["rfh_avg"]).astype(int)
+        df["wet_spell_len"] = df["wet_spell"] * (
+            df["wet_spell"].groupby((df["wet_spell"] != df["wet_spell"].shift()).cumsum()).cumcount() + 1
+        )
+
+        # -----------------------
+        # 8. Extreme Event Flags
+        # -----------------------
+        df["extreme_wet"] = (df["rfh"] > 1.5 * df["rfh_avg"]).astype(int)
+        df["extreme_dry"] = (df["rfh"] < 0.5 * df["rfh_avg"]).astype(int)
+
+        # -----------------------
+        # 9. Normalized Anomalies (scale to [-1, 1] roughly)
+        # -----------------------
+        for col in ["rfq", "r1q", "r3q"]:
+            df[f"{col}_norm"] = df[col] / 100.0
+
+        # -----------------------
+        # Final cleanup
+        # -----------------------
+        df.dropna(inplace=True)
+        self.df = df
+
+    def save(self, output_path: str):
+        """Save preprocessed dataset"""
+        self.df.to_csv(output_path, index=False)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Preprocess rainfall dataset with feature engineering")
-    parser.add_argument("--input_file", type=str, required=True, help="Path to cleaned CSV file")
-    parser.add_argument("--output_file", type=str, required=True, help="Path to save processed CSV")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Preprocess rainfall dataset")
+    parser.add_argument("--input", required=True, help="Path to cleaned CSV file")
+    parser.add_argument("--output", required=True, help="Path to save processed CSV file")
     args = parser.parse_args()
 
-    pre = Preprocessor(input_file=args.input_file, output_file=args.output_file)
-    pre.run_pipeline()
+    preprocessor = RainfallPreprocessor(args.input)
+    preprocessor.load_data()
+    preprocessor.feature_engineering()
+    preprocessor.save(args.output)
+
+    print(f"✅ Preprocessing complete. File saved to {args.output}")
 
